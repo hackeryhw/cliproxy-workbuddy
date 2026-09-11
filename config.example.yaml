@@ -1,0 +1,56 @@
+# Bind all interfaces so LAN Callers can reach the Host.
+host: ""
+port: 8317
+
+auth-dir: "~/.cli-proxy-api"
+
+# Management panel at /management.html. Empty secret-key disables the Management API.
+# allow-remote: false keeps management on localhost only.
+remote-management:
+  allow-remote: false
+  secret-key: "replace-with-a-long-random-management-key"
+  disable-control-panel: false
+  # Quota-page WorkBuddy cards are injected into static/management.html.
+  # Keep this true so an official panel build does not wipe the inject.
+  disable-auto-update-panel: true
+
+# Copy to config.yaml and replace this with a long random Caller key.
+api-keys:
+  - "replace-with-a-long-random-caller-key"
+
+debug: false
+request-retry: 3
+max-retry-credentials: 0
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+
+routing:
+  strategy: "fill-first"
+  session-affinity: false
+
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    gemini-cli:
+      enabled: false
+    workbuddy:
+      enabled: true
+      priority: 100
+
+# Optional OpenAI-compat upstream. Copy to config.yaml and set the upstream key.
+# chatgpt2api must be listening on the Host (default 127.0.0.1:8000).
+# openai-compatibility:
+#   - name: "chatgpt2api"
+#     disabled: false
+#     base-url: "http://127.0.0.1:8000/v1"
+#     api-key-entries:
+#       - api-key: "replace-with-chatgpt2api-auth-key"
+#     models:
+#       - name: "gpt-5-6-instant"
+#         alias: "gpt-5-6-instant"
+#       - name: "gpt-image-2"
+#         alias: "gpt-image-2"
+#         image: true

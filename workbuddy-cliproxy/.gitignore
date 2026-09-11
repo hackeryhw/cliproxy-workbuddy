@@ -1,0 +1,23 @@
+# 编译产物
+*.so
+*.dylib
+*.dll
+*.h
+
+# 凭据(含 access/refresh token,切勿提交)
+workbuddy.json
+
+# Go
+/vendor/
+
+# 本地编辑器/系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local build outputs
+workbuddy.dylib
+workbuddy.h
+workbuddy-cliproxy
+._*

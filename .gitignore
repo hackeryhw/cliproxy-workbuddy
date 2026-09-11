@@ -1,0 +1,16 @@
+# CPA 本体、编译好的插件、本机密钥。仓库只放源码和模板。
+/bin/
+/config.yaml
+/plugins/
+/chatgpt2api/
+
+.DS_Store
+._*
+*.bak
+*.log
+*.dylib
+*.so
+*.dll
+
+# 插件自己的 git 历史在硬盘上的 ProxyCLI 仓库里，这里只跟踪源码。
+/workbuddy-cliproxy/.git/
