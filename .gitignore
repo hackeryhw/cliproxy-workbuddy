@@ -1,5 +1,7 @@
 # CPA 本体、编译好的插件、本机密钥。仓库只放源码和模板。
-/bin/
+# bin/ 只放说明；二进制用 scripts/download.sh 拉（见 bin/README.md）。
+/bin/*
+!/bin/README.md
 /config.yaml
 /plugins/
 /chatgpt2api/
@@ -17,13 +19,19 @@
 PortSwigger_CA.crt
 PortSwigger_CA.der
 
-# Go 构建/模块缓存：默认位置不在仓库内，这里是外置卷上就地构建时留下的
-/.gocache/
-/.gomodcache/
-/workbuddy-cliproxy/.gocache/
-/workbuddy-cliproxy/.gomodcache/
-/workbuddy-cliproxy/workbuddy.dylib
-/workbuddy-cliproxy/workbuddy.h
+# Go 构建/模块缓存：就地构建时会落在仓库里，一律排除（含任意子目录）
+.gocache/
+.gomodcache/
+**/.gocache/
+**/.gomodcache/
+
+# 插件编译产物：仓库只放源码
+workbuddy-cliproxy/workbuddy.dylib
+workbuddy-cliproxy/workbuddy.h
+stealth-plugin/stealth.dylib
+stealth-plugin/stealth.h
+/cliproxy-stealth
+**/cliproxy-stealth
 
 # 本地备份
 .workbuddy-cliproxy-backup-*.tar.gz
