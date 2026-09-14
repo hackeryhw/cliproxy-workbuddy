@@ -13,7 +13,9 @@ if [ -n "${CPA_PLUGINS:-}" ]; then
 elif [ -d "$ROOT/../plugins" ]; then
   PLUGIN_DIR="$(cd "$ROOT/../plugins" && pwd)"
 else
-  PLUGIN_DIR="$HOME/Projects/Gemini API/plugins"
+  echo "plugins dir not found next to $ROOT" >&2
+  echo "set CPA_PLUGINS to the CPA plugins directory" >&2
+  exit 1
 fi
 
 if [ ! -d "$PLUGIN_DIR" ]; then

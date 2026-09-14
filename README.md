@@ -33,7 +33,9 @@ README.md                 本说明
 config.example.yaml       配置模板（不含密钥）
 scripts/                  下载 CPA、装后台服务、登录辅助
 static/management.html    管理面板页面（已注入 WorkBuddy 配额卡片）
-workbuddy-cliproxy/       WorkBuddy 插件源码
+workbuddy-cliproxy/       WorkBuddy 插件源码（签到、配额、账号轮换）
+stealth-plugin/           Stealth 插件源码（请求特征清洗，见下）
+bin/README.md             说明为什么 bin/ 不放二进制、怎么拉
 docs/                     本机部署的术语和 ADR
 ```
 
@@ -41,18 +43,50 @@ docs/                     本机部署的术语和 ADR
 
 | 路径 | 内容 |
 |------|------|
-| `bin/cli-proxy-api` | CPA 本体，用 `scripts/download.sh` 拉 7.2.149 |
-| `plugins/workbuddy.dylib` | 编译产物，用 `workbuddy-cliproxy/scripts/install-local.sh` 生成 |
+| `bin/cli-proxy-api` | CPA 本体，用 `scripts/download.sh` 拉 7.2.149（见 `bin/README.md`） |
+| `plugins/*.dylib` | 两个插件的编译产物，由各自的 `build.sh` / `install-local.sh` 生成 |
 | `config.yaml` | 调用密钥和管理密钥，从模板复制后自己填 |
 | `~/.cli-proxy-api/` | Buddy 登录态（`workbuddy.json` / `workbuddy-<uid>.json`）和日志 |
+
+## 两个插件分别是干什么的
+
+| 插件 | 类型 | 作用 |
+|------|------|------|
+| **workbuddy** | ModelProvider + AuthProvider + Executor | 把腾讯 CodeBuddy 接到 CPA：扫码登录、刷新 token、拉模型目录、转发对话、多账号轮换 |
+| **stealth** | RequestInterceptor | 改写各客户端内置的「身份特征句」，让上游的精确匹配失效（详见 `stealth-plugin/README.md`） |
+
+两者互不依赖，可以单独启用。`config.yaml` 里 `stealth` 的 `priority` 高于 `workbuddy`——拦截器要先于执行器看到请求。
+
 
 ## 克隆之后怎么用
 
 需要：macOS、Go 1.26+、gcc（编译插件用）、能登录 CodeBuddy 的账号。把下面的 `ROOT` 换成你放仓库的目录。本机现在用的是 `/Users/haoweiyang/Projects/Gemini API`。
 
+**换一台电脑，最短路径：**
+
 ```bash
 git clone https://github.com/hackeryhw/cliproxy-workbuddy.git
 cd cliproxy-workbuddy
+
+CLIPROXY_VERSION=v7.2.149 bash scripts/download.sh        # 1. 拉 CPA 本体（57MB，不入库）
+
+cp config.example.yaml config.yaml                        # 2. 写配置，然后自己改 api-keys / secret-key
+
+cd workbuddy-cliproxy && bash scripts/install-local.sh    # 3. 编译并部署 WorkBuddy 插件
+cd ../stealth-plugin   && bash build.sh                   # 4. 编译并部署 Stealth 插件
+
+cd .. && bash scripts/install-service.sh                  # 5. 装后台服务（只需一次）
+```
+
+然后打开 <http://127.0.0.1:8317/management.html> 登录 Buddy 账号即可（详见下文）。
+
+> **第 2 步不能跳过**：`install-service.sh` 会检查 `config.yaml` 是否存在，没有就直接退出。里面的 `api-keys` 和 `remote-management.secret-key` 也必须在启动前改掉。
+>
+> 三个 `build/install` 脚本都会自己重启 `local.cliproxyapi`（它没在跑就跳过）。第 3、4 步顺序无所谓，但**改完插件必须重启 CPA 才生效**——它不会热加载 `.dylib`。
+
+下面是每一步的展开说明。
+
+```bash
 ROOT="$PWD"
 ```
 
@@ -95,6 +129,17 @@ bash scripts/install-local.sh
 plugin loaded plugin_id=workbuddy
 plugin registered plugin_id=workbuddy ... version=0.3.2
 ```
+
+### 3b. 编译 Stealth 插件
+
+```bash
+cd stealth-plugin
+bash build.sh
+```
+
+产物是 `stealth.dylib`，同样拷进 `plugins/` 并重启服务。它是个 `RequestInterceptor`，只改写请求体里的特征句，不碰路由和凭据——启用与否不影响 WorkBuddy 的登录和账号轮换。清洗规则见 `stealth-plugin/README.md`。
+
+两个脚本都支持 `CPA_PLUGINS` 覆盖插件目录。插件目录的判定顺序是：`$CPA_PLUGINS` → 仓库根下的 `plugins/`。
 
 ### 4. 装成后台服务（只需一次）
 
