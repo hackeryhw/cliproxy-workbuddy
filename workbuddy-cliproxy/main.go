@@ -60,11 +60,13 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -80,10 +82,11 @@ const (
 	providerName  = "workbuddy"
 	authFileName  = "workbuddy.json"
 	upstreamBase  = "https://copilot.tencent.com"
-	clientUA      = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	clientVersion = "5.5.6"
+	clientUA      = "WorkBuddy/" + clientVersion + " WorkBuddy/" + clientVersion + " CLI/2.137.1"
 	originReferer = "https://www.codebuddy.cn"
 
-	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
+	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=workbuddy"
 	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
 	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
 	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
@@ -791,10 +794,41 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
-		URL:       st.AuthURL,
+		URL:       decorateLoginURL(st.AuthURL, clientVersion, newLoginSessionID()),
 		State:     st.State,
 		ExpiresAt: time.Now().Add(loginTTL).UTC(),
 	})
+}
+
+// decorateLoginURL appends the query the official WorkBuddy desktop client
+// adds after auth/state: version always, loginSessionId only on the workbuddy
+// channel. The server's authUrl is otherwise left intact.
+func decorateLoginURL(raw, version, loginSessionID string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	q := u.Query()
+	if v := strings.TrimSpace(version); v != "" {
+		q.Set("version", v)
+	}
+	if strings.EqualFold(strings.TrimSpace(q.Get("platform")), "workbuddy") {
+		if id := strings.TrimSpace(loginSessionID); id != "" {
+			q.Set("loginSessionId", id)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func newLoginSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 func handlePollLogin(raw []byte) ([]byte, error) {

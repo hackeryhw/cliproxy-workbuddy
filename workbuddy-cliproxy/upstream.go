@@ -515,9 +515,11 @@ type accountReport struct {
 	DailyCredit    int            `json:"daily_credit"`
 	TodayCredit    int            `json:"today_credit"`
 	TotalCredits   int            `json:"total_credits"`
-	ActivityName   string         `json:"activity_name,omitempty"`
-	Credits        *creditSummary `json:"credits,omitempty"`
-	Error          string         `json:"error,omitempty"`
+	ActivityName       string         `json:"activity_name,omitempty"`
+	GrowthTasksPending int            `json:"growth_tasks_pending,omitempty"`
+	GrowthTasksAllDone bool           `json:"growth_tasks_all_done"`
+	Credits            *creditSummary `json:"credits,omitempty"`
+	Error              string         `json:"error,omitempty"`
 }
 
 // quotaPayload mirrors the credit summary payload.
@@ -588,16 +590,19 @@ func buildAccountReport(entry pluginapi.HostAuthFileEntry) accountReport {
 	}
 	report.UID = sa.Account.UID
 
-	// The two upstream calls are independent, so run them together: the panel
-	// polls this on a timer and a serial pair visibly delays the cards.
+	// The upstream calls are independent, so run them together: the panel
+	// polls this on a timer and a serial trio visibly delays the cards.
 	var (
-		quotaResult   *billingResult
-		quotaErr      error
-		checkinResult *billingResult
-		checkinErr    error
-		wg            sync.WaitGroup
+		quotaResult        *billingResult
+		quotaErr           error
+		checkinResult      *billingResult
+		checkinErr         error
+		growthPending      int
+		growthAllDone      bool
+		growthErr          error
+		wg                 sync.WaitGroup
 	)
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		quotaResult, quotaErr = queryQuota(sa)
@@ -606,9 +611,16 @@ func buildAccountReport(entry pluginapi.HostAuthFileEntry) accountReport {
 		defer wg.Done()
 		checkinResult, checkinErr = queryCheckinStatus(sa)
 	}()
+	go func() {
+		defer wg.Done()
+		growthPending, growthAllDone, growthErr = growthAutoTasksStatus(sa)
+	}()
 	wg.Wait()
 
-	problems := make([]string, 0, 2)
+	report.GrowthTasksPending = growthPending
+	report.GrowthTasksAllDone = growthAllDone
+
+	problems := make([]string, 0, 3)
 
 	switch {
 	case quotaErr != nil:
@@ -634,6 +646,10 @@ func buildAccountReport(entry pluginapi.HostAuthFileEntry) accountReport {
 		}
 	default:
 		problems = append(problems, "checkin: "+checkinResult.Msg)
+	}
+
+	if growthErr != nil {
+		problems = append(problems, "growth_tasks: "+growthErr.Error())
 	}
 
 	if len(problems) > 0 {

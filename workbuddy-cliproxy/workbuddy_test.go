@@ -29,6 +29,7 @@ func TestRouteForPathMatchesHostFullPaths(t *testing.T) {
 		"/v0/management/plugins/workbuddy/checkin/status":  mgmtStatusPath,
 		"/v0/management/plugins/workbuddy/checkin/claim":   mgmtClaimPath,
 		"/v0/management/plugins/workbuddy/quota":           mgmtQuotaPath,
+		"/v0/management/plugins/workbuddy/tasks/auto_all": mgmtTasksAutoPath,
 		"/v0/management/plugins/workbuddy/checkin/status/": mgmtStatusPath,
 		"/v0/management/plugins/workbuddy/unknown":         "",
 		"": "",
@@ -276,8 +277,8 @@ func TestManagementRegistrationShapesMatchHostContract(t *testing.T) {
 	if !env.OK {
 		t.Fatal("registration envelope reported ok=false")
 	}
-	if len(env.Result.Routes) != 6 {
-		t.Errorf("routes = %d, want 6", len(env.Result.Routes))
+	if len(env.Result.Routes) != 7 {
+		t.Errorf("routes = %d, want 7", len(env.Result.Routes))
 	}
 	// Every advertised route must be reachable through routeForPath with the
 	// full host prefix, otherwise the panel would hit a 404.
@@ -1163,6 +1164,14 @@ func TestAccountsRouteStaysCheap(t *testing.T) {
 // per-account targeting.
 func TestAccountStatusRouteFetchesOnDemand(t *testing.T) {
 	hostWithTwoAccounts(t)
+	withStubGrowth(t, stubRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/v2/activity/growth/tasks") && r.Method == http.MethodGet {
+			return growthJSONResp(200, `{"code":0,"msg":"OK","data":{"tasks":[`+
+				`{"task_code":"chat_5","accept_status":"claimed","progress":{"current":5,"target":5}}`+
+				`]}}`), nil
+		}
+		return growthJSONResp(404, `{"code":404,"msg":"not found"}`), nil
+	}))
 	withStubBilling(t, map[string]int{}, 200, map[string]string{
 		"/get-user-resource-summary": `{"code":0,"msg":"OK","data":{"Packages":[` +
 			`{"PackageCode":"PKG-A","CycleTotalCapacity":"1600","CycleRemainCapacity":"1500",` +
@@ -1191,6 +1200,9 @@ func TestAccountStatusRouteFetchesOnDemand(t *testing.T) {
 		}
 		if a.Credits == nil || a.Credits.Remain != 1500 || a.Credits.Total != 1600 {
 			t.Errorf("credits wrong for %s: %+v", a.AuthIndex, a.Credits)
+		}
+		if !a.GrowthTasksAllDone {
+			t.Errorf("growth tasks should be all done for %s: %+v", a.AuthIndex, a)
 		}
 	}
 
@@ -1496,6 +1508,63 @@ func decodeAuthRefresh(t *testing.T, raw []byte) pluginapi.AuthRefreshResponse {
 		t.Fatalf("refresh envelope reported failure: %s", raw)
 	}
 	return env.Result
+}
+
+func TestDecorateLoginURLAddsDesktopQueryOnWorkbuddyChannel(t *testing.T) {
+	got := decorateLoginURL(
+		"https://www.workbuddy.cn/login?platform=workbuddy&state=abc",
+		"5.5.6",
+		"11111111-2222-4333-8333-444444444444",
+	)
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("decorateLoginURL returned unparseable URL %q: %v", got, err)
+	}
+	q := u.Query()
+	if q.Get("platform") != "workbuddy" || q.Get("state") != "abc" {
+		t.Errorf("lost original query: platform=%q state=%q", q.Get("platform"), q.Get("state"))
+	}
+	if q.Get("version") != "5.5.6" {
+		t.Errorf("version = %q, want 5.5.6", q.Get("version"))
+	}
+	if q.Get("loginSessionId") != "11111111-2222-4333-8333-444444444444" {
+		t.Errorf("loginSessionId = %q", q.Get("loginSessionId"))
+	}
+}
+
+func TestDecorateLoginURLSkipsSessionOnNonWorkbuddyChannel(t *testing.T) {
+	got := decorateLoginURL(
+		"https://copilot.tencent.com/login?platform=CLI&state=abc",
+		"5.5.6",
+		"11111111-2222-4333-8333-444444444444",
+	)
+	q, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Query().Get("version") != "5.5.6" {
+		t.Errorf("version = %q, want 5.5.6 even on CLI", q.Query().Get("version"))
+	}
+	if q.Query().Get("loginSessionId") != "" {
+		t.Errorf("loginSessionId = %q, want empty unless platform=workbuddy", q.Query().Get("loginSessionId"))
+	}
+}
+
+func TestDecorateLoginURLLeavesUnparseableInputAlone(t *testing.T) {
+	raw := "not a url"
+	if got := decorateLoginURL(raw, "5.5.6", "sid"); got != raw {
+		t.Errorf("got %q, want the original string", got)
+	}
+}
+
+func TestNewLoginSessionIDLooksLikeUUID(t *testing.T) {
+	id := newLoginSessionID()
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(id) {
+		t.Errorf("newLoginSessionID() = %q, want a UUID v4", id)
+	}
+	if other := newLoginSessionID(); other == id {
+		t.Fatal("newLoginSessionID returned the same value twice")
+	}
 }
 
 // TestLoginAuthDataNamesFilePerAccount is why a second scan-login must not

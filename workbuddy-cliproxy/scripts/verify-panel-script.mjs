@@ -201,6 +201,7 @@ const localStorage = (() => {
 const requests = [];
 let claimedIndex = null;
 let refreshedIndex = null;
+let tasksAutoIndex = null;
 
 // /accounts is the cheap call: names only, no credits.
 const ACCOUNT_LIST = {
@@ -209,15 +210,19 @@ const ACCOUNT_LIST = {
 };
 
 // /accounts/status is the expensive call, served only on demand.
-const ACCOUNT_STATUS = {
-  ok: true,
-  accounts: [{
-    auth_index: 'idx-1', name: 'workbuddy.json', label: '56657220', uid: 'uid-1',
-    checked_in_today: false, streak_days: 2, daily_credit: 100,
-    activity_name: '开学季',
-    credits: { total: 2100, remain: 2082.47, used: 17.53, unit: 'credits', is_paid: false },
-  }],
+const ACCOUNT_STATUS_BASE = {
+  auth_index: 'idx-1', name: 'workbuddy.json', label: '56657220', uid: 'uid-1',
+  checked_in_today: false, streak_days: 2, daily_credit: 100,
+  activity_name: '开学季',
+  credits: { total: 2100, remain: 2082.47, used: 17.53, unit: 'credits', is_paid: false },
 };
+let accountStatusMode = 'pending';
+function accountStatusPayload() {
+  const growth = accountStatusMode === 'done'
+    ? { growth_tasks_pending: 0, growth_tasks_all_done: true }
+    : { growth_tasks_pending: 2, growth_tasks_all_done: false };
+  return { ok: true, accounts: [Object.assign({}, ACCOUNT_STATUS_BASE, growth)] };
+}
 
 const fetchStub = (url, init = {}) => {
   const path = String(url);
@@ -238,7 +243,7 @@ const fetchStub = (url, init = {}) => {
       return json({ error: 'invalid management key' }, 401);
     }
   }
-  if (path.includes('/plugins/workbuddy/accounts/status')) return json(ACCOUNT_STATUS);
+  if (path.includes('/plugins/workbuddy/accounts/status')) return json(accountStatusPayload());
   if (path.endsWith('/plugins/workbuddy/accounts')) return json(ACCOUNT_LIST);
   if (path.endsWith('/plugins/workbuddy/checkin/claim')) {
     claimedIndex = JSON.parse(init.body || '{}').auth_index;
@@ -249,6 +254,13 @@ const fetchStub = (url, init = {}) => {
     return json({
       ok: true, account: '56657220', name: 'workbuddy.json',
       expires_at: '2026-11-10T09:13:43Z', message: '凭证已刷新，有效期至 2026-11-10 17:13',
+    });
+  }
+  if (path.endsWith('/plugins/workbuddy/tasks/auto_all')) {
+    tasksAutoIndex = JSON.parse(init.body || '{}').auth_index;
+    return json({
+      ok: true, account: '56657220', message: '完成 2 项，跳过 1 项',
+      results: [{ task_code: 'chat_5', status: 'done', message: '已补报 5 条对话事件' }],
     });
   }
   return json({ ok: false, error: { message: 'unexpected path ' + path } }, 404);
@@ -373,6 +385,17 @@ if (loadLink) {
   check('quota card shows the balance after the click',
     !!refreshed && refreshed.textContent.includes('2,082.47'),
     refreshed ? refreshed.textContent.slice(0, 80) : '');
+  const tasksBtn = refreshed && refreshed.querySelector('[data-workbuddy="quota-tasks"]');
+  check('quota card offers 一键任务 next to check-in', !!tasksBtn, tasksBtn ? tasksBtn.textContent : 'missing');
+  check('一键任务 is enabled while tasks remain', !!tasksBtn && !tasksBtn.disabled && tasksBtn.textContent === '一键任务');
+  if (tasksBtn) {
+    const beforeTasks = requests.length;
+    tasksBtn.click();
+    await settle(300);
+    const tasksReq = requests.slice(beforeTasks).find((r) => r.path.endsWith('/plugins/workbuddy/tasks/auto_all'));
+    check('一键任务 issues POST /tasks/auto_all', !!tasksReq && tasksReq.method === 'POST');
+    check('一键任务 names the account auth_index', tasksAutoIndex === 'idx-1', String(tasksAutoIndex));
+  }
 }
 
 // 6. Claim targets that account.
@@ -395,6 +418,18 @@ check('refresh reports the new expiry',
   refreshBtn.title.includes('2026-11-10'), refreshBtn.title);
 check('refresh does not fall back to the host expired marker',
   !requests.some((r) => r.path.endsWith('/auth-files/fields')));
+
+// 8. Completed growth tasks disable the button, like check-in.
+accountStatusMode = 'done';
+const refreshQuotaBtn = quotaPage.querySelector('[data-workbuddy="quota-refresh"]');
+if (refreshQuotaBtn) {
+  refreshQuotaBtn.click();
+  await settle(300);
+}
+const doneCard = quotaPage.querySelector('[data-workbuddy="quota-card"]');
+const doneTasksBtn = doneCard && doneCard.querySelector('[data-workbuddy="quota-tasks"]');
+check('growth tasks button shows 任务已完成 when all done',
+  !!doneTasksBtn && doneTasksBtn.textContent === '任务已完成' && doneTasksBtn.disabled);
 
 console.log('');
 if (failures.length) {

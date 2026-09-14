@@ -395,6 +395,25 @@
       .then(function () { button.setAttribute('data-busy', '0'); });
   }
 
+  function runTasksAuto(summary, button) {
+    if (button.getAttribute('data-busy') === '1') return;
+    var original = button.textContent;
+    button.setAttribute('data-busy', '1');
+    button.disabled = true;
+    button.textContent = '任务中…';
+    call('/tasks/auto_all', { method: 'POST', body: JSON.stringify({ auth_index: summary.auth_index }) })
+      .then(function (payload) {
+        button.title = (payload && payload.message) || '成长任务已执行';
+        return loadDetail(summary.auth_index, true);
+      })
+      .catch(function (err) {
+        button.textContent = '重试任务';
+        button.title = err.message;
+        button.disabled = false;
+      })
+      .then(function () { button.setAttribute('data-busy', '0'); });
+  }
+
   function runRefresh(summary, button) {
     if (button.getAttribute('data-busy') === '1') return;
     var original = button.textContent;
@@ -654,6 +673,16 @@
       claim.addEventListener('click', function () { runClaim(summary, claim); });
     }
     actions.appendChild(claim);
+    var tasksDone = !!detail.growth_tasks_all_done;
+    var tasks = quotaPill(tasksDone ? '任务已完成' : '一键任务', null, 'quota-tasks', false);
+    tasks.disabled = tasksDone;
+    tasks.title = tasksDone
+      ? '成长中心可自动任务均已领取'
+      : ('自动完成成长中心全部可脚本化任务（待完成 ' + (detail.growth_tasks_pending || 0) + ' 项）');
+    if (!tasksDone) {
+      tasks.addEventListener('click', function () { runTasksAuto(summary, tasks); });
+    }
+    actions.appendChild(tasks);
     actions.appendChild(quotaPill('刷新额度', function () {
       loadDetail(summary.auth_index, true);
     }, 'quota-refresh', true));
@@ -665,6 +694,7 @@
     var credits = detail.credits || {};
     return [
       'ok', summary.auth_index, detail.checked_in_today, detail.streak_days,
+      detail.growth_tasks_all_done, detail.growth_tasks_pending,
       detail.activity_name, credits.remain, credits.total, credits.used
     ].join(':');
   }

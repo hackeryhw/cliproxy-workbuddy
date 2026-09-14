@@ -37,6 +37,7 @@ const (
 	mgmtRefreshPath       = "/plugins/workbuddy/refresh"
 	mgmtAccountsPath      = "/plugins/workbuddy/accounts"
 	mgmtAccountStatusPath = "/plugins/workbuddy/accounts/status"
+	mgmtTasksAutoPath     = "/plugins/workbuddy/tasks/auto_all"
 	consolePagePath       = "/checkin"
 )
 
@@ -115,7 +116,7 @@ type mgmtResponse struct {
 // handleManagementRegister advertises the console routes to the host.
 func handleManagementRegister() ([]byte, error) {
 	pluginLog("info", "", "workbuddy console routes registered", map[string]any{
-		"routes":    []string{mgmtStatusPath, mgmtClaimPath, mgmtQuotaPath, mgmtRefreshPath, mgmtAccountsPath, mgmtAccountStatusPath},
+		"routes":    []string{mgmtStatusPath, mgmtClaimPath, mgmtQuotaPath, mgmtRefreshPath, mgmtAccountsPath, mgmtAccountStatusPath, mgmtTasksAutoPath},
 		"resources": []string{consolePagePath},
 	})
 	return okEnvelope(mgmtRegistration{
@@ -150,6 +151,11 @@ func handleManagementRegister() ([]byte, error) {
 				Path:        mgmtAccountStatusPath,
 				Description: "Credits and check-in state; pass auth_index for one account.",
 			},
+			{
+				Method:      http.MethodPost,
+				Path:        mgmtTasksAutoPath,
+				Description: "Auto-complete growth-center tasks for one account.",
+			},
 		},
 		Resources: []mgmtResourceRegistration{
 			{
@@ -183,6 +189,8 @@ func handleManagementHandle(raw []byte) ([]byte, error) {
 		return okEnvelope(handleAccountsRequest())
 	case mgmtAccountStatusPath:
 		return okEnvelope(handleAccountStatusRequest(req.HostCallbackID, req.authIndex()))
+	case mgmtTasksAutoPath:
+		return okEnvelope(handleTasksAutoRequest(req.HostCallbackID, req.authIndex()))
 	default:
 		return okEnvelope(jsonError(http.StatusNotFound, "not_found", "unknown management path: "+req.Path))
 	}
@@ -209,6 +217,8 @@ func routeForPath(path string) string {
 		return mgmtAccountStatusPath
 	case strings.HasSuffix(path, mgmtAccountsPath):
 		return mgmtAccountsPath
+	case strings.HasSuffix(path, mgmtTasksAutoPath):
+		return mgmtTasksAutoPath
 	case strings.HasSuffix(path, consolePagePath):
 		return consolePagePath
 	default:
@@ -473,6 +483,46 @@ func handleAccountsRequest() mgmtResponse {
 		return jsonError(http.StatusBadGateway, "accounts_failed", err.Error())
 	}
 	return jsonResponse(accountsEnvelope{OK: true, Accounts: summaries})
+}
+
+// tasksAutoEnvelope is the /tasks/auto_all payload.
+type tasksAutoEnvelope struct {
+	OK      bool             `json:"ok"`
+	Account string           `json:"account,omitempty"`
+	Results []autoTaskResult `json:"results"`
+	Message string           `json:"message,omitempty"`
+}
+
+// handleTasksAutoRequest runs the growth-task automation pipeline for one account.
+func handleTasksAutoRequest(callbackID, authIndex string) mgmtResponse {
+	if strings.TrimSpace(authIndex) == "" {
+		return jsonError(http.StatusBadRequest, "auth_index_required", "auth_index is required")
+	}
+	target, err := resolveAccount(authIndex)
+	if err != nil {
+		return jsonError(http.StatusBadGateway, "credential_unavailable", err.Error())
+	}
+	if !tryLockTaskAuto(authIndex) {
+		return jsonError(http.StatusConflict, "task_busy", "该账号有任务正在执行中，请稍后再试")
+	}
+	defer unlockTaskAuto(authIndex)
+
+	results, summary, err := runGrowthTasksAuto(target.Credential)
+	if err != nil {
+		pluginLog("warn", callbackID, "workbuddy growth tasks auto failed", map[string]any{
+			"account": target.Label, "error": err.Error(),
+		})
+		return jsonError(http.StatusBadGateway, "tasks_auto_failed", err.Error())
+	}
+	pluginLog("info", callbackID, "workbuddy growth tasks auto finished", map[string]any{
+		"account": target.Label, "summary": summary, "count": len(results),
+	})
+	return jsonResponse(tasksAutoEnvelope{
+		OK:      true,
+		Account: target.Label,
+		Results: results,
+		Message: summary,
+	})
 }
 
 // handleAccountStatusRequest is the on-demand half: credits plus check-in state,
