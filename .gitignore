@@ -11,6 +11,23 @@
 *.dylib
 *.so
 *.dll
+*.h
 
-# 插件自己的 git 历史在硬盘上的 ProxyCLI 仓库里，这里只跟踪源码。
+# 抓包用的公开根证书（PortSwigger CA，无私钥；但属于本机工具配置，不入库）
+PortSwigger_CA.crt
+PortSwigger_CA.der
+
+# Go 构建/模块缓存：默认位置不在仓库内，这里是外置卷上就地构建时留下的
+/.gocache/
+/.gomodcache/
+/workbuddy-cliproxy/.gocache/
+/workbuddy-cliproxy/.gomodcache/
+/workbuddy-cliproxy/workbuddy.dylib
+/workbuddy-cliproxy/workbuddy.h
+
+# 本地备份
+.workbuddy-cliproxy-backup-*.tar.gz
+
+# 插件源码现在就住在 workbuddy-cliproxy/ 里，由本仓库直接跟踪。
+# 不要再嵌套一个 .git —— 那会让这个目录变成 submodule，两边改动互相看不见。
 /workbuddy-cliproxy/.git/

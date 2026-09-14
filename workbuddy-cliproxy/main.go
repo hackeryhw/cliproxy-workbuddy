@@ -62,6 +62,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -216,12 +217,16 @@ func hostCall(method string, request []byte) ([]byte, error) {
 // streamEmit pushes one chunk payload to the host stream. Returns an error if
 // the host rejected it (e.g. the client already disconnected and the stream
 // was closed), which the pump uses to stop reading a dead upstream.
+//
+// It goes through hostTransport rather than hostCall directly so that the
+// streaming path shares the one seam every other host interaction uses -- which
+// is also what lets a test observe the chunks a rotation emits.
 func streamEmit(streamID string, payload []byte) error {
 	if streamID == "" {
 		return fmt.Errorf("no stream id")
 	}
 	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "payload": payload})
-	_, err := hostCall(pluginabi.MethodHostStreamEmit, body)
+	_, err := hostTransport(pluginabi.MethodHostStreamEmit, body)
 	return err
 }
 
@@ -238,7 +243,7 @@ func streamClose(streamID string) {
 		return
 	}
 	body, _ := json.Marshal(map[string]any{"stream_id": streamID})
-	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
+	_, _ = hostTransport(pluginabi.MethodHostStreamClose, body)
 }
 
 // -----------------------------------------------------------------------------
@@ -524,6 +529,13 @@ func sharedHTTPClient() *http.Client {
 	return sharedClient
 }
 
+// upstreamHTTPDo is the transport seam for chat completion calls. Production
+// points it at the shared client; tests replace it so the rotation path can be
+// driven through a scripted sequence of upstream responses.
+var upstreamHTTPDo = func(req *http.Request) (*http.Response, error) {
+	return sharedHTTPClient().Do(req)
+}
+
 // newLoginClient builds an isolated client with its own cookie jar so that the
 // browser login for one state can never leak into another.
 func newLoginClient() *http.Client {
@@ -546,6 +558,14 @@ func commonHeaders(req *http.Request) {
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
+//
+// The IDE identity headers (X-IDE-Name/Type/Version) and the request-correlation
+// headers (X-Request-Id, X-Conversation-*) are not decoration: the gateway
+// fingerprints the calling channel from them. The official desktop client sets
+// all of them on every chat call (cli/dist/codebuddy.js, the axiosToFetchAdapter
+// path), and a request that omits them is refused with HTTP 400
+// code=11128 "Illegal API invocation from an unapproved channel" -- which is
+// what happened before these were added.
 func backendHeaders(req *http.Request, sa *storedAuth) {
 	commonHeaders(req)
 	if sa.Auth.AccessToken != "" {
@@ -567,11 +587,36 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
 	}
 	if sa.Auth.Domain != "" {
+		// Passed through rather than pinned to copilot.tencent.com: the official
+		// client sends the credential's own issuer domain here (www.workbuddy.cn
+		// for accounts signed in through the WorkBuddy app), and the gateway
+		// accepts that pairing.
 		req.Header.Set("X-Domain", sa.Auth.Domain)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Product", "SaaS")
+	applyChannelIdentityHeaders(req)
+}
+
+// applyChannelIdentityHeaders declares the calling client to the gateway.
+//
+// Values mirror the official WorkBuddy 5.5.6 desktop client. The conversation
+// and request identifiers are freshly generated per request: they are
+// correlation ids, so any unique value is valid, but they must be present.
+func applyChannelIdentityHeaders(req *http.Request) {
+	req.Header.Set("X-IDE-Name", "WorkBuddy")
+	req.Header.Set("X-IDE-Type", "WorkBuddy")
+	req.Header.Set("X-IDE-Version", clientVersion)
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Agent-Type", "main")
+	req.Header.Set("x-codebuddy-request", "1")
+
+	requestID := newLoginSessionID()
+	req.Header.Set("X-Request-ID", requestID)
+	req.Header.Set("X-Conversation-ID", requestID)
+	req.Header.Set("X-Conversation-Message-ID", requestID)
+	req.Header.Set("X-Conversation-Request-ID", requestID)
 }
 
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}
@@ -1027,7 +1072,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
 
-	// No async stream id → fall back to synchronous chunk collection.
+	// No async stream id -> fall back to synchronous chunk collection.
 	if req.StreamID == "" {
 		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
 		if errCollect != nil {
@@ -1036,16 +1081,10 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
-	if err != nil {
-		streamEmitError(req.StreamID, err.Error())
-		streamClose(req.StreamID)
-		return okEnvelope(streamResponse{Headers: headers})
-	}
-	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	// Async: return immediately with empty chunks. A goroutine opens the upstream
+	// and emits each chunk via host.stream.emit so the client sees true
+	// streaming. Rotation happens inside the pump, before the first emit.
+	go pumpUpstreamStream(body, sa, req.StreamID, sseFramed)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -1057,24 +1096,99 @@ func streamHeaders() http.Header {
 	return h
 }
 
-// pumpUpstreamStream reads the upstream SSE response in the background and
-// emits each cleaned chunk to the host stream. It closes the stream when done.
-// An emit failure (client disconnected → host closed the stream) aborts the
+// pumpUpstreamStream opens the upstream SSE response and emits each cleaned
+// chunk to the host stream, closing the stream when done.
+//
+// Account rotation lives here rather than in the host, because the host cannot
+// classify a plugin executor error (see rotate.go). The rule that makes it safe
+// is: rotate only until the first chunk has been emitted. Before that point the
+// client has received nothing but response headers, so a second attempt is
+// indistinguishable from a slow first one. After the first emit the response is
+// committed -- retrying would splice two upstream attempts into one stream -- so
+// a failure from there on is reported, not retried.
+//
+// An emit failure (client disconnected -> host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
+func pumpUpstreamStream(body []byte, sa *storedAuth, streamID string, sseFramed bool) {
+	// Enumerate the pool once. The credential the host selected is resolved to
+	// its pool index and marked tried, since retrying it would only reproduce
+	// the failure we are routing around.
+	rot := newRotator()
+	active := sa
+	activeIndex := hostAuthIndex(rot.pool, sa)
+	rot.mark(activeIndex)
+
+	var lastErr error
+
+	for attempt := 0; attempt < maxRotateAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(rotateWait)
+		}
+
+		emitted, errOpen := streamOnce(active, body, streamID, sseFramed)
+		if errOpen == nil {
+			streamClose(streamID)
+			return
+		}
+		lastErr = errOpen
+
+		// The response is already on the wire: report and stop.
+		if emitted {
+			streamClose(streamID)
+			return
+		}
+
+		var ue *upstreamError
+		if !errors.As(errOpen, &ue) || !retryableUpstreamStatus(ue) {
+			streamEmitError(streamID, errOpen.Error())
+			streamClose(streamID)
+			return
+		}
+
+		next, ok := rot.next(activeIndex)
+		if !ok {
+			break
+		}
+		rot.mark(next.Entry.AuthIndex)
+		pluginLog("warn", "", "workbuddy rotation: switching account", map[string]any{
+			"from":    active.Account.UID,
+			"to":      credentialLabel(next.Entry),
+			"status":  ue.Status,
+			"attempt": attempt + 1,
+			"reason":  ue.Body,
+		})
+		active = next.Credential
+		activeIndex = next.Entry.AuthIndex
+	}
+
+	if lastErr != nil {
+		streamEmitError(streamID, lastErr.Error())
+	}
+	streamClose(streamID)
+}
+
+// streamOnce performs one upstream attempt and pumps its chunks.
+//
+// It reports whether any chunk reached the client, which is what tells the
+// caller whether a retry is still invisible.
+func streamOnce(sa *storedAuth, body []byte, streamID string, sseFramed bool) (bool, error) {
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
-		return
+		return false, err
+	}
+	backendHeaders(httpReq, sa)
+
+	resp, err := upstreamHTTPDo(httpReq)
+	if err != nil {
+		return false, fmt.Errorf("http_error: %w", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
+		return false, newUpstreamError(resp)
 	}
+
+	emitted := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -1083,10 +1197,15 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 			continue
 		}
 		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
-			break
+			// The client is gone; stop reading but do not invite a retry.
+			return true, nil
 		}
+		emitted = true
 	}
-	streamClose(streamID)
+	if err := scanner.Err(); err != nil && !emitted {
+		return false, fmt.Errorf("http_error: %w", err)
+	}
+	return emitted, nil
 }
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain

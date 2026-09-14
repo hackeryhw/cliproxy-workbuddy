@@ -21,3 +21,8 @@ workbuddy.dylib
 workbuddy.h
 workbuddy-cliproxy
 ._*
+
+# Go build/module caches kept inside the repo when the default
+# locations outside the workspace are not writable.
+/.gocache/
+/.gomodcache/

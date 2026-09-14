@@ -19,6 +19,19 @@
 
 本机和 CPA 放在同一目录时，从仓库根目录看说明：[上层 README](../README.md)。
 
+## 目录
+
+| 文件 | 作用 |
+|------|------|
+| `main.go` | 插件入口、RPC 分发、认证、执行器、请求头 |
+| `rotate.go` | **多账号轮换**（错误分类、凭据池、轮换决策） |
+| `upstream.go` | 上游调用（凭据枚举、计费、模型目录） |
+| `management.go` | 管理 API 与控制台路由注册 |
+| `console_page.go` | 独立签到页（`/v0/resource/plugins/workbuddy/checkin`） |
+| `growth_tasks.go` / `growth_desktop.go` | 成长中心任务自动化、桌面端埋点 |
+| `panel/workbuddy-panel.js` | 面板注入脚本（配额卡片、签到按钮） |
+| `workbuddy_test.go` / `rotate_test.go` / `headers_test.go` / `growth_tasks_test.go` | 测试 |
+
 ## 多账号
 
 每个 Buddy 账号一份凭据，登录后写入 `~/.cli-proxy-api/workbuddy-<uid>.json`。已经存在的 `workbuddy.json` 会继续用。
@@ -26,6 +39,56 @@
 - 再扫一个**新**号：面板里再添加一次 WorkBuddy 凭据，不会覆盖已有账号
 - 再扫**同一个**号：只更新那份文件
 - 额度页和签到页按账号分卡
+
+### 从官方 App 导入账号
+
+`WorkBuddy.app` 已登录的号可以直接搬过来，不用重新扫码：
+
+```bash
+bash scripts/import-official-account.sh
+```
+
+读的是 `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`，写 `~/.cli-proxy-api/workbuddy-<uid>.json`（权限 `0600`）。同一个 uid 已存在会拒绝（退出码 2），不会覆盖也不会重复。
+
+登录一个**新**号 → 跑一次脚本 → 循环。凭据里的 `domain` 是**登录域**（token 的 issuer），脚本原样搬运：
+
+- `copilot.tencent.com` —— 旧的 `.com` 体系
+- `www.workbuddy.cn` —— WorkBuddy App 的新体系
+
+两者都受支持，混在同一个池子里没问题，插件会把 `domain` 如实透传成 `X-Domain`（见下面「渠道身份」）。
+
+### 自动轮换账号
+
+宿主每次只给插件**一个**凭据，失败后不会自己换下一个——因为插件执行器返回的错误是普通 `error`，宿主读不到 HTTP 状态码（`statusCodeFromError` 需要 `StatusCode() int` 接口，拿不到就当 0，于是不重试）。
+
+所以换号由插件自己做（`rotate.go`）：
+
+- **只在第一个 chunk 发出前换号。** 之前客户端只收到响应头，换号对它是不可见的；一旦有 chunk 发出，响应就提交了，此时失败只报错不重试——否则会把两次上游尝试缝进同一个流里。
+- **最多烧 3 个凭据**（`maxRotateAttempts`），间隔 250ms。目的是扛过某个号挂了/被限流，不是在上游全挂时硬刷整池。
+- **可重试的失败**：
+  - `403 / 408 / 429 / 500 / 502 / 503 / 504`
+  - **`HTTP 400` + 业务码 `11128`**（`Illegal API invocation from an unapproved channel`）——看着像请求错，其实是账号/渠道维度的拒绝，换个号可能就过了
+- **不重试**：`400 / 401 / 404 / 422` 等请求本身的错——每个号都会一样地失败，换号只会放大上游压力
+
+触发时日志会打：
+
+```
+workbuddy rotation: switching account reason={"code":11128,"msg":"Illegal API invocation from an unapproved channel",...}
+```
+
+> 说明：插件上报的 `fields` 里其实带了 `from` / `to` / `status` / `attempt`，但宿主日志只渲染 `reason` 这一个键，所以**看日志只能看到失败原因，看不到换到了哪个号**。想定位换号结果，配合上游调用后的成功/失败记录一起看。
+
+### 额度与限流
+
+每个号有独立的额度/频率限制。上游的业务错误有的走 HTTP 状态码，有的走响应体里的 `code` 字段。常见：
+
+| `code` | 含义 | 是否换号 |
+|--------|------|----------|
+| `6004` | 使用量超出频率限制（响应里给出重置时间） | 视 HTTP 状态码而定（见下） |
+| `11101` | 拒绝非流式请求 | 否（插件内部已改为流式，正常遇不到） |
+| `11128` | 渠道未批准 | **是**（按业务码特判，见上） |
+
+`6004` 的 HTTP 状态码上游给的是限流类（`429`）还是 `200`，取决于具体网关实现；实测日志里它确实触发了换号。想确认某个版本的行为，看日志里那条 `rotation: switching account` 有没有出现。
 
 ## 安装
 
@@ -37,7 +100,7 @@
 bash scripts/install-local.sh
 ```
 
-脚本会编译 `workbuddy.dylib`、拷进旁边的 `plugins/`，并重启 `local.cliproxyapi`。
+脚本会编译 `workbuddy.dylib`、拷进旁边的 `plugins/`，并重启 `local.cliproxyapi`。插件目录的判定顺序：`$CPA_PLUGINS` → 仓库上一级的 `plugins/` → `~/Projects/Gemini API/plugins`。
 
 单独编译：
 
@@ -61,6 +124,12 @@ plugins:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/local.cliproxyapi
+```
+
+替换现网插件前先备份（`workbuddy.dylib` 被 `*.dylib` 规则忽略，不进 git）：
+
+```bash
+cp "$PLUGIN_DIR/workbuddy.dylib" "$PLUGIN_DIR/workbuddy.dylib.bak-$(date +%Y%m%d-%H%M%S)"
 ```
 
 然后到面板添加 WorkBuddy 凭据并扫码。要第二个账号，再添加一次。
@@ -89,6 +158,26 @@ curl http://localhost:8317/v1/chat/completions \
 ```
 
 流式和非流式都可以。非流式会在插件内部改成流式再聚合（上游 `code 11101` 拒绝非流式）。
+
+## 管理 API
+
+面板 key 鉴权（`Authorization: Bearer <management key>`），挂在 `/v0/management` 下：
+
+| 方法 | 路径 | 上游调用 | 用途 |
+|------|------|----------|------|
+| GET | `/plugins/workbuddy/accounts` | 0 次 | 账号列表（画卡片框） |
+| GET | `/plugins/workbuddy/accounts/status` | 每号 2 次 | 额度 + 签到态（带 `auth_index` 则只查该号） |
+| GET | `/plugins/workbuddy/quota` | 1 次 | 定向查额度 |
+| GET | `/plugins/workbuddy/checkin/status` | 1 次 | 定向查签到状态 |
+| POST | `/plugins/workbuddy/checkin/claim` | 1–2 次 | 定向签到 |
+| POST | `/plugins/workbuddy/refresh` | 1 次 | 轮换凭证并写回 |
+| POST | `/plugins/workbuddy/tasks/auto_all` | 多次 | 一键做成长中心任务 |
+
+资源路由（免鉴权，供面板 iframe 嵌入）：
+
+```
+GET http://<host>:8317/v0/resource/plugins/workbuddy/checkin
+```
 
 ## 签到与积分
 
@@ -133,6 +222,25 @@ minimax-m3 · minimax-m2.7 · minimax-m2.5
 
 混元（`hy3` / `hy4` / `hunyuan-*`）会强制 `reasoning_effort=high`。思考内容走 SSE 的 `delta.reasoning_content`。
 
+## 渠道身份（重要）
+
+上游网关会从**请求头**判断调用方是不是"被批准的渠道"。官方 WorkBuddy 桌面客户端每条对话请求都会带这些头（见 `cli/dist/codebuddy.js` 的 `axiosToFetchAdapter`）：
+
+```text
+X-IDE-Name: WorkBuddy          X-Agent-Intent: craft
+X-IDE-Type: WorkBuddy          X-Agent-Type:   main
+X-IDE-Version: 5.5.6           x-codebuddy-request: 1
+X-Request-ID · X-Conversation-ID · X-Conversation-Message-ID · X-Conversation-Request-ID
+```
+
+**少任何一个都可能被拒**，表现为：
+
+```
+HTTP 400  {"code":11128,"msg":"Illegal API invocation from an unapproved channel", ...}
+```
+
+插件在 `applyChannelIdentityHeaders()` 里补齐这些头，关联 ID 每请求新生成。`X-Domain` 则**如实透传**凭据自己的登录域（`.cn` 号发 `.cn`、`.com` 号发 `.com`）——这正是官方客户端的行为，把它写死成 `copilot.tencent.com` 是错的。
+
 ## 上游接口
 
 | # | 方法 | 路径 | 用途 |
@@ -156,6 +264,29 @@ CGO_ENABLED=1 go test ./...
 ```
 
 没有本机 Buddy 凭据时，真实上游测试会跳过。没有 node 时，浏览器端测试会跳过。
+
+轮换和请求头这两块有专门的回归测试：
+
+- `rotate_test.go` —— 错误分类（含 `11128` 必须换号、普通 400 必须不换）、凭据池跳过、流式轮换四种状态
+- `headers_test.go` —— 渠道身份头契约、关联 ID 每请求唯一、`X-Domain` 透传
+
+## 排障
+
+| 现象 | 原因 / 处理 |
+|------|-------------|
+| `400 code 11128` | 渠道身份头缺失或被拒。确认跑的是含 `applyChannelIdentityHeaders()` 的版本；仍然报错就把响应体原样留档 |
+| `code 6004` | 该号频率/用量超限，响应里有重置时间。通常会自动换号（看日志有无 `rotation: switching account`） |
+| 日志 `context deadline exceeded`（model registrar） | 拉 `/v3/config` 超时，通常不影响插件注册；确认网络可达上游 |
+| 改完插件行为没变 | `.dylib` 不会热加载，必须重启 CPA |
+| 面板只显示 UUID 不显示昵称 | 看的是宿主原生「认证文件」页；插件注入的卡片会显示昵称 |
+
+抓官方 App 的真实流量（验证上游行为时用）：
+
+```bash
+bash start-workbuddy-via-burp.sh
+```
+
+强制 Env 代理 + Electron `--proxy-server`，并注入 Burp CA。注意：**部分后台通道不走代理**，抓不到模型请求本身（该 App 的对话连接会直连上游），别据此误判"请求没发出"。
 
 ## Claude Code 和流式
 
