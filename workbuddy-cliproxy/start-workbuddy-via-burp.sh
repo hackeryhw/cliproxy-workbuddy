@@ -10,11 +10,19 @@ set -euo pipefail
 BURP_HOST="127.0.0.1"
 BURP_PORT="8080"
 PROXY="http://${BURP_HOST}:${BURP_PORT}"
-CA_CERT="/Volumes/MyPassport/Projects/ProxyCLI/PortSwigger_CA.crt"
 APP="/Applications/WorkBuddy.app/Contents/MacOS/Electron"
+
+# The CA ships next to this script, so the checkout works from any directory.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+CA_CERT="${BURP_CA_CERT:-$HERE/PortSwigger_CA.crt}"
 
 if [[ ! -x "$APP" ]]; then
   echo "找不到 WorkBuddy 可执行文件: $APP" >&2
+  exit 1
+fi
+if [[ ! -f "$CA_CERT" ]]; then
+  echo "找不到 Burp CA: $CA_CERT" >&2
+  echo "从 Burp 导出证书到该路径，或用 BURP_CA_CERT 指定。" >&2
   exit 1
 fi
 
